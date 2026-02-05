@@ -1,0 +1,1 @@
+flutter run --no-pub --android-project-arg=-Dkotlin.compiler.execution.strategy="in-process"
