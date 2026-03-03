@@ -55,6 +55,8 @@ dependencies:
   # 🆕 音频引擎与后台锁屏控制
   just_audio: ^0.9.36
   just_audio_background: ^0.0.1-beta.11
+  # 🆕 增加后台静默任务引擎
+  workmanager: ^0.9.0
 
 dev_dependencies:
   flutter_test:

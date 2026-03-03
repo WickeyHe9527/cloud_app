@@ -21,18 +21,147 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 
-// 音频引擎与后台控制
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 
-// 全局音频播放器实例，确保跨页面播放不断流
+// 引入后台任务管理器
+import 'package:workmanager/workmanager.dart';
+
+// === 全局状态与管理器 ===
 final AudioPlayer _globalAudioPlayer = AudioPlayer();
 String _currentPlayingName = "";
+final TransferManager globalTransferManager = TransferManager();
+
+// =========================================================================
+// 🚀 完全独立运行的后台幽灵进程（用于夜间 Wi-Fi 充电静默备份）
+// =========================================================================
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((taskName, inputData) async {
+    if (taskName != "autoBackupTask") return Future.value(true);
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final serverUrl = prefs.getString('server_ip');
+      final token = prefs.getString('server_token');
+      final autoSyncEnabled = prefs.getBool('auto_sync_enabled') ?? false;
+
+      // 如果未登录或关闭了自动备份，则停止
+      if (serverUrl == null || token == null || !autoSyncEnabled) {
+        return Future.value(true);
+      }
+
+      // 后台获取相册权限并读取
+      List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
+        type: RequestType.common,
+      );
+      if (albums.isEmpty) return Future.value(true);
+
+      // 只扫描最近的 500 张照片进行比对，防止后台任务超时被系统强杀
+      List<AssetEntity> latestAssets = await albums[0].getAssetListRange(
+        start: 0,
+        end: 500,
+      );
+      List<String> assetIds = latestAssets.map((e) => e.id).toList();
+
+      // 本地 SQLite 极速过滤
+      Set<String> localSyncedIds = await SyncDatabase.getSyncedIds(assetIds);
+      List<AssetEntity> toUpload = latestAssets
+          .where((a) => !localSyncedIds.contains(a.id))
+          .toList();
+
+      if (toUpload.isEmpty) return Future.value(true); // 全都传过了，直接收工睡觉
+
+      // 开始静默上传
+      final client = http.Client();
+      for (var asset in toUpload) {
+        File? file = await asset.file;
+        if (file == null) continue;
+
+        DateTime date = asset.createDateTime;
+        String targetFolder =
+            "相册备份/${date.year}年${date.month.toString().padLeft(2, '0')}月/${asset.type == AssetType.video ? "视频" : "图片"}";
+        String fileName = file.path.split(Platform.pathSeparator).last;
+        int totalSize = await file.length();
+
+        // 断点续传检测
+        var checkRes = await client.post(
+          Uri.parse('$serverUrl/check_upload'),
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer $token",
+          },
+          body: jsonEncode({
+            "path": targetFolder,
+            "filename": fileName,
+            "total_size": totalSize,
+          }),
+        );
+
+        if (checkRes.statusCode == 200) {
+          var data = jsonDecode(checkRes.body);
+          if (data['status'] == 'finished') {
+            await SyncDatabase.markSynced(asset.id);
+            continue;
+          }
+
+          int uploaded = data['uploaded'] ?? 0;
+          RandomAccessFile raf = await file.open(mode: FileMode.read);
+          bool success = true;
+
+          try {
+            while (uploaded < totalSize) {
+              raf.setPositionSync(uploaded);
+              int currentChunkSize = (totalSize - uploaded) > 5 * 1024 * 1024
+                  ? 5 * 1024 * 1024
+                  : (totalSize - uploaded);
+              List<int> chunk = raf.readSync(currentChunkSize);
+
+              var request = http.MultipartRequest(
+                'POST',
+                Uri.parse('$serverUrl/upload_chunk'),
+              );
+              request.headers['Authorization'] = 'Bearer $token';
+              request.fields['path'] = targetFolder;
+              request.fields['filename'] = fileName;
+              request.fields['offset'] = uploaded.toString();
+              request.fields['total_size'] = totalSize.toString();
+              request.files.add(
+                http.MultipartFile.fromBytes('file', chunk, filename: fileName),
+              );
+
+              var response = await client
+                  .send(request)
+                  .timeout(const Duration(seconds: 30));
+              if (response.statusCode == 200) {
+                uploaded += currentChunkSize;
+              } else {
+                success = false;
+                break;
+              }
+            }
+          } catch (e) {
+            success = false;
+          } finally {
+            raf.closeSync();
+          }
+
+          if (success) await SyncDatabase.markSynced(asset.id); // 上传成功，打卡
+        }
+      }
+      client.close();
+    } catch (e) {
+      debugPrint("后台静默同步异常: $e");
+    }
+    return Future.value(true);
+  });
+}
+// =========================================================================
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 加上 try-catch 防护，即使音频组件在某些机型初始化失败，App 也能正常打开
+  // 初始化锁屏音频中心
   try {
     await JustAudioBackground.init(
       androidNotificationChannelId: 'com.example.cloud_app.audio',
@@ -43,12 +172,18 @@ Future<void> main() async {
     debugPrint("后台音频初始化提醒: $e");
   }
 
+  // 注册后台任务引擎
+  try {
+    Workmanager().initialize(callbackDispatcher); // 👈 直接闭合即可
+  } catch (e) {
+    debugPrint("Workmanager init failed: $e");
+  }
+
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -63,10 +198,149 @@ class MyApp extends StatelessWidget {
   }
 }
 
+// === 后台传输任务管理器 (带本地持久化) ===
+enum TaskType { upload, download, sync }
+
+class TransferTask {
+  final String id = DateTime.now().millisecondsSinceEpoch.toString();
+  final String name;
+  final TaskType type;
+  final Future<void> Function(TransferTask task) execute;
+
+  double progress = 0.0;
+  String statusText = "排队中...";
+  bool isRunning = false;
+  bool isDone = false;
+  bool isError = false;
+  bool isCanceled = false;
+  http.Client? client;
+
+  TransferTask({required this.name, required this.type, required this.execute});
+
+  void cancel() {
+    isCanceled = true;
+    statusText = "已取消";
+    client?.close();
+    globalTransferManager.saveHistory();
+    globalTransferManager.notifyListeners();
+  }
+}
+
+class TransferManager extends ChangeNotifier {
+  List<TransferTask> tasks = [];
+  bool _isProcessingQueue = false;
+
+  TransferManager() {
+    _loadHistory();
+  }
+
+  Future<void> _loadHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    List<String>? history = prefs.getStringList('transfer_history');
+    if (history != null) {
+      for (var str in history) {
+        try {
+          var map = jsonDecode(str);
+          var task = TransferTask(
+            name: map['name'],
+            type: TaskType.values[map['type']],
+            execute: (t) async {},
+          );
+          task.progress = map['progress'] ?? 0.0;
+          task.statusText = map['statusText'] ?? '';
+          task.isDone = map['isDone'] ?? false;
+          task.isError = map['isError'] ?? false;
+          task.isCanceled = map['isCanceled'] ?? false;
+          if (!task.isDone && !task.isError && !task.isCanceled) {
+            task.isError = true;
+            task.statusText = "App意外关闭，传输中断";
+          }
+          tasks.add(task);
+        } catch (e) {}
+      }
+      notifyListeners();
+    }
+  }
+
+  Future<void> saveHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    List<String> history = tasks
+        .map(
+          (t) => jsonEncode({
+            'name': t.name,
+            'type': t.type.index,
+            'progress': t.progress,
+            'statusText': t.statusText,
+            'isDone': t.isDone,
+            'isError': t.isError,
+            'isCanceled': t.isCanceled,
+          }),
+        )
+        .toList();
+    await prefs.setStringList('transfer_history', history);
+  }
+
+  void addTask(TransferTask task) {
+    tasks.insert(0, task);
+    saveHistory();
+    notifyListeners();
+    _processQueue();
+  }
+
+  int get activeCount =>
+      tasks.where((t) => !t.isDone && !t.isError && !t.isCanceled).length;
+
+  Future<void> _processQueue() async {
+    if (_isProcessingQueue) return;
+    _isProcessingQueue = true;
+    WakelockPlus.enable();
+
+    while (true) {
+      var pendingTasks = tasks
+          .where(
+            (t) => !t.isRunning && !t.isDone && !t.isError && !t.isCanceled,
+          )
+          .toList();
+      if (pendingTasks.isEmpty) break;
+
+      var task = pendingTasks.last;
+      task.isRunning = true;
+      task.statusText = "准备处理...";
+      notifyListeners();
+
+      try {
+        await task.execute(task);
+        if (!task.isCanceled) {
+          task.isDone = true;
+          task.progress = 1.0;
+          task.statusText = "已完成";
+        }
+      } catch (e) {
+        if (!task.isCanceled) {
+          task.isError = true;
+          task.statusText = "失败: ${e.toString().split('\n')[0]}";
+        }
+      } finally {
+        task.isRunning = false;
+        task.client?.close();
+        saveHistory();
+        notifyListeners();
+      }
+    }
+    _isProcessingQueue = false;
+    WakelockPlus.disable();
+  }
+
+  void clearCompleted() {
+    tasks.removeWhere((t) => t.isDone || t.isCanceled || t.isError);
+    saveHistory();
+    notifyListeners();
+  }
+}
+
 // === 本地同步记录数据库类 ===
 class SyncDatabase {
   static Database? _db;
-
   static Future<Database> get database async {
     if (_db != null) return _db!;
     String dbPath = p.join(await getDatabasesPath(), 'sync_history.db');
@@ -101,15 +375,6 @@ class SyncDatabase {
   }
 }
 
-class AssetUploadInfo {
-  final AssetEntity asset;
-  final File file;
-  final String remotePath;
-  final String uploadFolder;
-  AssetUploadInfo(this.asset, this.file, this.remotePath, this.uploadFolder);
-}
-
-// ================== 1. 连接页 ==================
 class ConnectPage extends StatefulWidget {
   const ConnectPage({super.key});
   @override
@@ -140,14 +405,16 @@ class _ConnectPageState extends State<ConnectPage> {
     String ip = _ipController.text.trim();
     String user = _userController.text.trim();
     String pwd = _pwdController.text.trim();
-
     if (!ip.startsWith('http')) ip = 'http://$ip';
     if (pwd.isEmpty) {
-      _msg("请输入密码");
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请输入密码')));
       return;
     }
 
     setState(() => _isConnecting = true);
+
     try {
       final response = await http
           .post(
@@ -159,14 +426,11 @@ class _ConnectPageState extends State<ConnectPage> {
 
       if (response.statusCode == 200) {
         final prefs = await SharedPreferences.getInstance();
-        var data = jsonDecode(response.body);
-        String token = data['token'];
-
+        String token = jsonDecode(response.body)['token'];
         await prefs.setString('server_token', token);
         await prefs.setString('server_ip', ip);
         await prefs.setString('server_user', user);
         await prefs.setString('server_pwd', pwd);
-
         if (!mounted) return;
         Navigator.pushReplacement(
           context,
@@ -176,20 +440,17 @@ class _ConnectPageState extends State<ConnectPage> {
           ),
         );
       } else if (response.statusCode == 401) {
-        _msg("用户名或密码错误");
-      } else {
-        _msg("连接异常: ${response.statusCode}");
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('用户名或密码错误')));
       }
     } catch (e) {
-      _msg("连接失败，请检查IP和网络");
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('连接失败，请检查网络')));
     } finally {
       if (mounted) setState(() => _isConnecting = false);
     }
-  }
-
-  void _msg(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   void _openScanner() async {
@@ -299,7 +560,6 @@ class QRScanPage extends StatelessWidget {
   }
 }
 
-// ================== 2. AI 智能搜图页 ==================
 class SmartSearchPage extends StatefulWidget {
   final String serverUrl;
   final String token;
@@ -308,7 +568,6 @@ class SmartSearchPage extends StatefulWidget {
     required this.serverUrl,
     required this.token,
   });
-
   @override
   State<SmartSearchPage> createState() => _SmartSearchPageState();
 }
@@ -331,9 +590,12 @@ class _SmartSearchPageState extends State<SmartSearchPage> {
           )
           .timeout(const Duration(minutes: 30));
       if (response.statusCode == 200 && mounted) {
-        var data = jsonDecode(response.body);
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('学习完成！已索引 ${data['indexed']} 张照片')),
+          SnackBar(
+            content: Text(
+              '学习完成！已索引 ${jsonDecode(response.body)['indexed']} 张照片',
+            ),
+          ),
         );
       }
     } catch (e) {
@@ -365,9 +627,6 @@ class _SmartSearchPageState extends State<SmartSearchPage> {
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('搜索失败: $e')));
     } finally {
       setState(() => _isSearching = false);
     }
@@ -428,12 +687,10 @@ class _SmartSearchPageState extends State<SmartSearchPage> {
                     itemCount: _results.length,
                     itemBuilder: (ctx, index) {
                       var item = _results[index];
-                      // 缩略图请求，带上 Header 鉴权
                       String url =
                           "${widget.serverUrl}/thumbnail?path=${Uri.encodeComponent(item['path'])}";
                       return InkWell(
                         onTap: () {
-                          // 全屏大图使用 URL Token
                           Navigator.push(
                             context,
                             MaterialPageRoute(
@@ -491,7 +748,95 @@ class _SmartSearchPageState extends State<SmartSearchPage> {
   }
 }
 
-// ================== 3. 文件列表页 ==================
+class TransferPage extends StatelessWidget {
+  const TransferPage({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("传输中心"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.clear_all),
+            tooltip: "清除已完成",
+            onPressed: () => globalTransferManager.clearCompleted(),
+          ),
+        ],
+      ),
+      body: AnimatedBuilder(
+        animation: globalTransferManager,
+        builder: (context, child) {
+          if (globalTransferManager.tasks.isEmpty)
+            return const Center(
+              child: Text("暂无传输任务", style: TextStyle(color: Colors.grey)),
+            );
+          return ListView.builder(
+            itemCount: globalTransferManager.tasks.length,
+            itemBuilder: (context, index) {
+              final task = globalTransferManager.tasks[index];
+              IconData icon = task.type == TaskType.upload
+                  ? Icons.upload_file
+                  : (task.type == TaskType.download
+                        ? Icons.download
+                        : Icons.sync);
+              Color color = task.type == TaskType.upload
+                  ? Colors.orange
+                  : (task.type == TaskType.download
+                        ? Colors.green
+                        : Colors.blue);
+              return Card(
+                margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                child: ListTile(
+                  leading: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      CircularProgressIndicator(
+                        value: task.isRunning ? null : task.progress,
+                        color: color,
+                        backgroundColor: Colors.grey[200],
+                      ),
+                      Icon(icon, size: 20, color: color),
+                    ],
+                  ),
+                  title: Text(
+                    task.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  subtitle: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          task.statusText,
+                          style: TextStyle(
+                            color: task.isError ? Colors.red : Colors.grey,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      Text(
+                        "${(task.progress * 100).toInt()}%",
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ],
+                  ),
+                  trailing: (!task.isDone && !task.isError && !task.isCanceled)
+                      ? IconButton(
+                          icon: const Icon(Icons.close, color: Colors.red),
+                          onPressed: () => task.cancel(),
+                        )
+                      : null,
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
 enum SortType { name, size, date }
 
 List<String> _globalClipboardFiles = [];
@@ -508,7 +853,6 @@ class FileListPage extends StatefulWidget {
     required this.serverUrl,
     required this.token,
   });
-
   @override
   State<FileListPage> createState() => _FileListPageState();
 }
@@ -518,20 +862,14 @@ class _FileListPageState extends State<FileListPage> {
   List<dynamic> _displayFiles = [];
   bool isLoading = true,
       _isGridView = false,
-      _isUploading = false,
-      _isOpeningFile = false,
-      _isProcessing = false;
-  bool _abortSync = false, _isAborting = false;
-  http.Client? _uploadClient;
-  AssetEntity? _currentSyncingAsset;
-  double _progressValue = 0.0;
-  String _progressText = "";
-  bool _isSelectionMode = false, _isSearching = false;
+      _isSelectionMode = false,
+      _isSearching = false;
   final Set<String> _selectedFiles = {};
   Map<String, dynamic>? _diskInfo;
   final TextEditingController _searchController = TextEditingController();
   SortType _sortType = SortType.name;
   bool _isAscending = true;
+  bool _autoSyncEnabled = false;
 
   @override
   void initState() {
@@ -539,16 +877,28 @@ class _FileListPageState extends State<FileListPage> {
     fetchFiles();
     _fetchDiskUsage();
     _searchController.addListener(_applyFilterAndSort);
+    globalTransferManager.addListener(_onTransferManagerChanged);
+
+    // 初始化时加载开关状态
+    SharedPreferences.getInstance().then((prefs) {
+      if (mounted)
+        setState(
+          () => _autoSyncEnabled = prefs.getBool('auto_sync_enabled') ?? false,
+        );
+    });
   }
 
   @override
   void dispose() {
     _searchController.dispose();
-    _uploadClient?.close();
+    globalTransferManager.removeListener(_onTransferManagerChanged);
     super.dispose();
   }
 
-  // === 音频播放器相关方法 (已修复防丢 Token + 增加倍速) ===
+  void _onTransferManagerChanged() {
+    if (globalTransferManager.activeCount == 0 && mounted) fetchFiles();
+  }
+
   Future<void> _playAudio(String fileName, String url) async {
     setState(() {
       _currentPlayingName = fileName;
@@ -557,8 +907,6 @@ class _FileListPageState extends State<FileListPage> {
       await _globalAudioPlayer.setAudioSource(
         AudioSource.uri(
           Uri.parse(url),
-          // 已经通过在 URL 后面拼接 ?token= 解决了 HTTP Range 被丢请求头的问题
-          // 锁屏显示的元数据
           tag: MediaItem(
             id: url,
             title: fileName,
@@ -571,12 +919,7 @@ class _FileListPageState extends State<FileListPage> {
       );
       _globalAudioPlayer.play();
       _showAudioPlayerSheet();
-    } catch (e) {
-      if (mounted)
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('无法播放音乐: $e')));
-    }
+    } catch (e) {}
   }
 
   void _showAudioPlayerSheet() {
@@ -639,11 +982,10 @@ class _FileListPageState extends State<FileListPage> {
                     );
                   },
                 ),
-                // 播放暂停与倍速控件
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    const SizedBox(width: 60), // 用于居中占位
+                    const SizedBox(width: 60),
                     StreamBuilder<PlayerState>(
                       stream: _globalAudioPlayer.playerStateStream,
                       builder: (context, snapshot) {
@@ -671,15 +1013,11 @@ class _FileListPageState extends State<FileListPage> {
                           final speed = snapshot.data ?? 1.0;
                           return TextButton(
                             onPressed: () {
-                              double newSpeed = 1.0;
-                              if (speed == 1.0)
-                                newSpeed = 1.25;
-                              else if (speed == 1.25)
-                                newSpeed = 1.5;
-                              else if (speed == 1.5)
-                                newSpeed = 2.0;
-                              else
-                                newSpeed = 1.0;
+                              double newSpeed = speed == 1.0
+                                  ? 1.25
+                                  : (speed == 1.25
+                                        ? 1.5
+                                        : (speed == 1.5 ? 2.0 : 1.0));
                               _globalAudioPlayer.setSpeed(newSpeed);
                             },
                             child: Text(
@@ -705,12 +1043,158 @@ class _FileListPageState extends State<FileListPage> {
   }
 
   String _formatDuration(Duration d) {
-    String minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    String seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return "$minutes:$seconds";
+    return "${d.inMinutes.remainder(60).toString().padLeft(2, '0')}:${d.inSeconds.remainder(60).toString().padLeft(2, '0')}";
   }
 
-  // === 核心业务逻辑 ===
+  Future<void> _uploadFile() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+    );
+    if (result != null) {
+      String pathSnapshot = widget.currentPath;
+      for (var file in result.files) {
+        if (file.path == null) continue;
+        File localFile = File(file.path!);
+        String fileName = file.name;
+        globalTransferManager.addTask(
+          TransferTask(
+            name: fileName,
+            type: TaskType.upload,
+            execute: (task) async {
+              task.client = http.Client();
+              int totalSize = await localFile.length(),
+                  chunkSize = 5 * 1024 * 1024,
+                  uploaded = 0;
+              var checkRes = await task.client!
+                  .post(
+                    Uri.parse('${widget.serverUrl}/check_upload'),
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer ${widget.token}",
+                    },
+                    body: jsonEncode({
+                      "path": pathSnapshot,
+                      "filename": fileName,
+                      "total_size": totalSize,
+                    }),
+                  )
+                  .timeout(const Duration(seconds: 10));
+
+              if (checkRes.statusCode == 200) {
+                var data = jsonDecode(checkRes.body);
+                if (data['status'] == 'finished') {
+                  task.progress = 1.0;
+                  return;
+                }
+                uploaded = data['uploaded'] ?? 0;
+              }
+              RandomAccessFile raf = await localFile.open(mode: FileMode.read);
+              try {
+                while (uploaded < totalSize) {
+                  if (task.isCanceled) break;
+                  raf.setPositionSync(uploaded);
+                  int currentChunkSize = (totalSize - uploaded) > chunkSize
+                      ? chunkSize
+                      : (totalSize - uploaded);
+                  List<int> chunk = raf.readSync(currentChunkSize);
+                  var request = http.MultipartRequest(
+                    'POST',
+                    Uri.parse('${widget.serverUrl}/upload_chunk'),
+                  );
+                  request.headers['Authorization'] = 'Bearer ${widget.token}';
+                  request.fields['path'] = pathSnapshot;
+                  request.fields['filename'] = fileName;
+                  request.fields['offset'] = uploaded.toString();
+                  request.fields['total_size'] = totalSize.toString();
+                  request.files.add(
+                    http.MultipartFile.fromBytes(
+                      'file',
+                      chunk,
+                      filename: fileName,
+                    ),
+                  );
+                  var streamedResponse = await task.client!
+                      .send(request)
+                      .timeout(const Duration(seconds: 30));
+
+                  if (streamedResponse.statusCode == 200) {
+                    uploaded += currentChunkSize;
+                    task.progress = uploaded / totalSize;
+                    task.statusText =
+                        "${(uploaded / 1024 / 1024).toStringAsFixed(1)} / ${(totalSize / 1024 / 1024).toStringAsFixed(1)} MB";
+                    globalTransferManager.notifyListeners();
+                  } else {
+                    throw Exception("网络中断");
+                  }
+                }
+              } finally {
+                raf.closeSync();
+              }
+            },
+          ),
+        );
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已将 ${result.files.length} 个文件加入后台上传队列')),
+      );
+    }
+  }
+
+  Future<void> _batchDownload() async {
+    int count = _selectedFiles.length;
+    for (String name in _selectedFiles) {
+      String encodedPath = Uri.encodeComponent(
+        "${widget.currentPath.isEmpty ? "" : "${widget.currentPath}/"}$name",
+      );
+      String downloadUrl =
+          "${widget.serverUrl}/download/$encodedPath?token=${widget.token}";
+      globalTransferManager.addTask(
+        TransferTask(
+          name: name,
+          type: TaskType.download,
+          execute: (task) async {
+            task.client = http.Client();
+            var request = http.Request('GET', Uri.parse(downloadUrl));
+            var streamedResponse = await task.client!.send(request);
+            if (streamedResponse.statusCode != 200)
+              throw Exception("下载失败: ${streamedResponse.statusCode}");
+            int totalBytes = streamedResponse.contentLength ?? 0,
+                receivedBytes = 0;
+            List<int> bytes = [];
+            await for (var chunk in streamedResponse.stream) {
+              if (task.isCanceled) return;
+              bytes.addAll(chunk);
+              receivedBytes += chunk.length;
+              if (totalBytes > 0) {
+                task.progress = receivedBytes / totalBytes;
+                task.statusText =
+                    "${(receivedBytes / 1024 / 1024).toStringAsFixed(1)}MB / ${(totalBytes / 1024 / 1024).toStringAsFixed(1)}MB";
+                globalTransferManager.notifyListeners();
+              }
+            }
+            final tempDir = await getTemporaryDirectory();
+            final savePath = '${tempDir.path}/$name';
+            await File(savePath).writeAsBytes(bytes);
+            if (name.toLowerCase().endsWith('.mp4') ||
+                name.toLowerCase().endsWith('.mov'))
+              await Gal.putVideo(savePath);
+            else if ([
+              '.jpg',
+              '.png',
+              '.jpeg',
+              '.gif',
+            ].any((e) => name.toLowerCase().endsWith(e)))
+              await Gal.putImage(savePath);
+          },
+        ),
+      );
+    }
+    _exitSelectionMode();
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('已将 $count 个文件加入后台下载队列')));
+  }
+
   Future<void> _syncGallery() async {
     final PermissionState ps = await PhotoManager.requestPermissionExtend();
     if (!ps.isAuth) {
@@ -720,7 +1204,6 @@ class _FileListPageState extends State<FileListPage> {
         ).showSnackBar(const SnackBar(content: Text('请授予相册权限')));
       return;
     }
-
     final List<ConnectivityResult> connectivityResult = await (Connectivity()
         .checkConnectivity());
     if (connectivityResult.contains(ConnectivityResult.mobile) &&
@@ -745,313 +1228,60 @@ class _FileListPageState extends State<FileListPage> {
       if (allowMobile != true) return;
     }
 
-    WakelockPlus.enable();
-    setState(() {
-      _isProcessing = true;
-      _abortSync = false;
-      _isAborting = false;
-      _progressValue = 0.0;
-      _progressText = "扫描相册...";
-      _currentSyncingAsset = null;
-    });
-    _uploadClient = http.Client();
+    globalTransferManager.addTask(
+      TransferTask(
+        name: "手机相册手动全面备份",
+        type: TaskType.sync,
+        execute: (task) async {
+          task.client = http.Client();
+          task.statusText = "正在扫描系统相册...";
+          globalTransferManager.notifyListeners();
 
-    try {
-      List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
-        type: RequestType.common,
-      );
-      if (albums.isEmpty) throw Exception("没有找到相册");
-      List<AssetEntity> allAssets = await albums[0].getAssetListRange(
-        start: 0,
-        end: 100000,
-      );
-      List<AssetEntity> photoAssets = allAssets
-          .where((e) => e.type == AssetType.image)
-          .toList();
-      List<AssetEntity> videoAssets = allAssets
-          .where((e) => e.type == AssetType.video)
-          .toList();
-
-      int total = allAssets.length,
-          processed = 0,
-          successCount = 0,
-          skippedCount = 0;
-
-      for (int i = 0; i < photoAssets.length; i += 20) {
-        if (_abortSync) break;
-        int end = (i + 20 < photoAssets.length) ? i + 20 : photoAssets.length;
-        List<AssetEntity> batch = photoAssets.sublist(i, end);
-        if (batch.isNotEmpty && mounted)
-          setState(() => _currentSyncingAsset = batch.first);
-
-        var results = await _processBatch(batch, "同步照片");
-        successCount += results['success']!;
-        skippedCount += results['skipped']!;
-        processed += batch.length;
-        if (!_abortSync && mounted)
-          setState(() {
-            _progressValue = processed / total;
-            _progressText = "同步照片中... (${processed}/${total})";
-          });
-      }
-
-      for (int i = 0; i < videoAssets.length; i++) {
-        if (_abortSync) break;
-        if (mounted)
-          setState(() {
-            _currentSyncingAsset = videoAssets[i];
-            _progressText = "同步视频中...";
-          });
-        var results = await _processBatch(
-          [videoAssets[i]],
-          "同步视频",
-          isVideo: true,
-        );
-        successCount += results['success']!;
-        skippedCount += results['skipped']!;
-        processed += 1;
-        if (!_abortSync && mounted)
-          setState(() => _progressValue = processed / total);
-      }
-
-      if (mounted && !_abortSync)
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('同步完成: 传 $successCount, 跳过 $skippedCount')),
-        );
-    } catch (e) {
-      if (!_abortSync && mounted)
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('同步出错: $e')));
-    } finally {
-      _uploadClient?.close();
-      _uploadClient = null;
-      WakelockPlus.disable();
-      if (mounted)
-        setState(() {
-          _isProcessing = false;
-          _isAborting = false;
-          _progressText = "";
-          _currentSyncingAsset = null;
-        });
-      fetchFiles();
-    }
-  }
-
-  void _triggerAbort() {
-    setState(() {
-      _abortSync = true;
-      _isAborting = true;
-      _progressText = "正在中止...";
-    });
-    _uploadClient?.close();
-  }
-
-  Future<Map<String, int>> _processBatch(
-    List<AssetEntity> batchAssets,
-    String stageName, {
-    bool isVideo = false,
-  }) async {
-    if (_abortSync || _uploadClient == null)
-      return {'success': 0, 'skipped': 0};
-    int success = 0, skipped = 0;
-    try {
-      List<String> batchIds = batchAssets.map((e) => e.id).toList();
-      Set<String> localSyncedIds = await SyncDatabase.getSyncedIds(batchIds);
-      List<AssetEntity> needProcessAssets = [];
-      for (var asset in batchAssets) {
-        if (localSyncedIds.contains(asset.id))
-          skipped++;
-        else
-          needProcessAssets.add(asset);
-      }
-      if (needProcessAssets.isEmpty) return {'success': 0, 'skipped': skipped};
-
-      List<AssetUploadInfo?> infos = await Future.wait(
-        needProcessAssets.map((asset) async {
-          File? f = await asset.file;
-          if (f == null) return null;
-          DateTime date = asset.createDateTime;
-          String monthFolder =
-              "${date.year}年${date.month.toString().padLeft(2, '0')}月";
-          String typeFolder = (asset.type == AssetType.video) ? "视频" : "图片";
-          String targetFolder = "相册备份/$monthFolder/$typeFolder";
-          String fileName = f.path.split(Platform.pathSeparator).last;
-          return AssetUploadInfo(
-            asset,
-            f,
-            "$targetFolder/$fileName",
-            targetFolder,
+          List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
+            type: RequestType.common,
           );
-        }),
-      );
+          if (albums.isEmpty) throw Exception("没有找到相册");
+          List<AssetEntity> allAssets = await albums[0].getAssetListRange(
+            start: 0,
+            end: 100000,
+          );
+          List<AssetEntity> needSyncAssets = [];
 
-      List<AssetUploadInfo> validInfos = infos
-          .whereType<AssetUploadInfo>()
-          .toList();
-      if (validInfos.isEmpty) return {'success': 0, 'skipped': skipped};
+          for (int i = 0; i < allAssets.length; i += 500) {
+            if (task.isCanceled) return;
+            task.statusText = "比对本地数据 (${i}/${allAssets.length})";
+            globalTransferManager.notifyListeners();
 
-      var res = await _uploadClient!
-          .post(
-            Uri.parse('${widget.serverUrl}/batch_check_exists'),
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": "Bearer ${widget.token}",
-            },
-            body: jsonEncode({
-              "paths": validInfos.map((e) => e.remotePath).toList(),
-            }),
-          )
-          .timeout(const Duration(seconds: 10));
-
-      List<bool> existsList = (res.statusCode == 200)
-          ? List<bool>.from(jsonDecode(res.body)['results'])
-          : List.filled(validInfos.length, false);
-      List<AssetUploadInfo> toUpload = [];
-
-      for (int k = 0; k < validInfos.length; k++) {
-        if (k < existsList.length && existsList[k]) {
-          skipped++;
-          await SyncDatabase.markSynced(validInfos[k].asset.id);
-        } else
-          toUpload.add(validInfos[k]);
-      }
-
-      if (_abortSync) return {'success': success, 'skipped': skipped};
-
-      if (toUpload.isNotEmpty) {
-        if (isVideo) {
-          for (var info in toUpload) {
-            if (_abortSync) break;
-            if (await _uploadSingleFile(info, isVideo: true)) {
-              success++;
-              await SyncDatabase.markSynced(info.asset.id);
+            int end = (i + 500 < allAssets.length) ? i + 500 : allAssets.length;
+            List<AssetEntity> batch = allAssets.sublist(i, end);
+            Set<String> localSyncedIds = await SyncDatabase.getSyncedIds(
+              batch.map((e) => e.id).toList(),
+            );
+            for (var asset in batch) {
+              if (!localSyncedIds.contains(asset.id)) needSyncAssets.add(asset);
             }
           }
-        } else {
-          List<bool> results = await Future.wait(
-            toUpload.map((info) => _uploadSingleFile(info, isVideo: false)),
-          );
-          for (int i = 0; i < results.length; i++) {
-            if (results[i]) {
-              success++;
-              await SyncDatabase.markSynced(toUpload[i].asset.id);
-            }
+
+          if (needSyncAssets.isEmpty) {
+            task.statusText = "已是最新，无文件需同步";
+            return;
           }
-        }
-      }
-    } catch (e) {}
-    return {'success': success, 'skipped': skipped};
-  }
 
-  Future<bool> _uploadSingleFile(
-    AssetUploadInfo info, {
-    required bool isVideo,
-  }) async {
-    if (_uploadClient == null) return false;
-    int totalSize = await info.file.length(),
-        chunkSize = 5 * 1024 * 1024,
-        uploaded = 0;
-    String fileName = info.file.path.split(Platform.pathSeparator).last;
+          int total = needSyncAssets.length, processed = 0;
 
-    try {
-      var checkRes = await _uploadClient!
-          .post(
-            Uri.parse('${widget.serverUrl}/check_upload'),
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": "Bearer ${widget.token}",
-            },
-            body: jsonEncode({
-              "path": info.uploadFolder,
-              "filename": fileName,
-              "total_size": totalSize,
-            }),
-          )
-          .timeout(const Duration(seconds: 10));
-      if (checkRes.statusCode == 200) {
-        var data = jsonDecode(checkRes.body);
-        if (data['status'] == 'finished') return true;
-        uploaded = data['uploaded'] ?? 0;
-      }
-    } catch (e) {
-      uploaded = 0;
-    }
+          for (var asset in needSyncAssets) {
+            if (task.isCanceled) return;
+            processed++;
+            File? f = await asset.file;
+            if (f == null) continue;
 
-    RandomAccessFile raf = await info.file.open(mode: FileMode.read);
-    try {
-      while (uploaded < totalSize) {
-        if (_abortSync) {
-          raf.closeSync();
-          return false;
-        }
-        raf.setPositionSync(uploaded);
-        int remain = totalSize - uploaded;
-        int currentChunkSize = remain > chunkSize ? chunkSize : remain;
-        List<int> chunk = raf.readSync(currentChunkSize);
+            DateTime date = asset.createDateTime;
+            String targetFolder =
+                "相册备份/${date.year}年${date.month.toString().padLeft(2, '0')}月/${asset.type == AssetType.video ? "视频" : "图片"}";
+            String fileName = f.path.split(Platform.pathSeparator).last;
+            int totalSize = await f.length();
 
-        var request = http.MultipartRequest(
-          'POST',
-          Uri.parse('${widget.serverUrl}/upload_chunk'),
-        );
-        request.headers['Authorization'] = 'Bearer ${widget.token}';
-        request.fields['path'] = info.uploadFolder;
-        request.fields['filename'] = fileName;
-        request.fields['offset'] = uploaded.toString();
-        request.fields['total_size'] = totalSize.toString();
-        request.files.add(
-          http.MultipartFile.fromBytes('file', chunk, filename: fileName),
-        );
-
-        var streamedResponse = await _uploadClient!
-            .send(request)
-            .timeout(const Duration(seconds: 30));
-        if (streamedResponse.statusCode == 200) {
-          var data = jsonDecode(await streamedResponse.stream.bytesToString());
-          if (data['status'] == 'finished') break;
-          uploaded += currentChunkSize;
-          if (isVideo && mounted && !_isAborting)
-            setState(() {
-              _progressValue = uploaded / totalSize;
-              _progressText =
-                  "大视频同步中... ${(uploaded / 1024 / 1024).toStringAsFixed(1)}MB";
-            });
-        } else {
-          raf.closeSync();
-          return false;
-        }
-      }
-    } catch (e) {
-      raf.closeSync();
-      return false;
-    }
-    raf.closeSync();
-    return true;
-  }
-
-  Future<void> _uploadFile() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles(
-      allowMultiple: true,
-    );
-    if (result != null) {
-      setState(() {
-        _isProcessing = true;
-        _progressValue = 0.0;
-        _progressText = "准备上传...";
-      });
-      _uploadClient = http.Client();
-      int successCount = 0;
-      try {
-        for (int i = 0; i < result.files.length; i++) {
-          if (result.files[i].path == null) continue;
-          File localFile = File(result.files[i].path!);
-          String fileName = result.files[i].name;
-          int totalSize = await localFile.length(),
-              chunkSize = 5 * 1024 * 1024,
-              uploaded = 0;
-
-          try {
-            var checkRes = await _uploadClient!
+            var checkRes = await task.client!
                 .post(
                   Uri.parse('${widget.serverUrl}/check_upload'),
                   headers: {
@@ -1059,85 +1289,70 @@ class _FileListPageState extends State<FileListPage> {
                     "Authorization": "Bearer ${widget.token}",
                   },
                   body: jsonEncode({
-                    "path": widget.currentPath,
+                    "path": targetFolder,
                     "filename": fileName,
                     "total_size": totalSize,
                   }),
                 )
                 .timeout(const Duration(seconds: 10));
-            if (checkRes.statusCode == 200) {
-              var data = jsonDecode(checkRes.body);
-              if (data['status'] == 'finished') {
-                successCount++;
-                continue;
-              }
-              uploaded = data['uploaded'] ?? 0;
+
+            if (checkRes.statusCode == 200 &&
+                jsonDecode(checkRes.body)['status'] == 'finished') {
+              await SyncDatabase.markSynced(asset.id);
+              continue;
             }
-          } catch (e) {}
 
-          RandomAccessFile raf = await localFile.open(mode: FileMode.read);
-          bool isFileSuccess = true;
-          try {
-            while (uploaded < totalSize) {
-              if (_abortSync) break;
-              raf.setPositionSync(uploaded);
-              int remain = totalSize - uploaded;
-              int currentChunkSize = remain > chunkSize ? chunkSize : remain;
-              List<int> chunk = raf.readSync(currentChunkSize);
+            RandomAccessFile raf = await f.open(mode: FileMode.read);
+            int uploaded = jsonDecode(checkRes.body)['uploaded'] ?? 0;
+            try {
+              while (uploaded < totalSize) {
+                if (task.isCanceled) break;
+                raf.setPositionSync(uploaded);
+                int currentChunkSize = (totalSize - uploaded) > 5 * 1024 * 1024
+                    ? 5 * 1024 * 1024
+                    : (totalSize - uploaded);
+                List<int> chunk = raf.readSync(currentChunkSize);
 
-              var request = http.MultipartRequest(
-                'POST',
-                Uri.parse('${widget.serverUrl}/upload_chunk'),
-              );
-              request.headers['Authorization'] = 'Bearer ${widget.token}';
-              request.fields['path'] = widget.currentPath;
-              request.fields['filename'] = fileName;
-              request.fields['offset'] = uploaded.toString();
-              request.fields['total_size'] = totalSize.toString();
-              request.files.add(
-                http.MultipartFile.fromBytes('file', chunk, filename: fileName),
-              );
+                var request = http.MultipartRequest(
+                  'POST',
+                  Uri.parse('${widget.serverUrl}/upload_chunk'),
+                );
+                request.headers['Authorization'] = 'Bearer ${widget.token}';
+                request.fields['path'] = targetFolder;
+                request.fields['filename'] = fileName;
+                request.fields['offset'] = uploaded.toString();
+                request.fields['total_size'] = totalSize.toString();
+                request.files.add(
+                  http.MultipartFile.fromBytes(
+                    'file',
+                    chunk,
+                    filename: fileName,
+                  ),
+                );
 
-              var streamedResponse = await _uploadClient!
-                  .send(request)
-                  .timeout(const Duration(seconds: 30));
-              if (streamedResponse.statusCode == 200) {
-                uploaded += currentChunkSize;
-                if (mounted)
-                  setState(() {
-                    _progressValue = uploaded / totalSize;
-                    _progressText =
-                        "上传文件 (${i + 1}/${result.files.length})\n$fileName\n(${(uploaded / 1024 / 1024).toStringAsFixed(1)}MB)";
-                  });
-              } else {
-                isFileSuccess = false;
-                break;
+                var response = await task.client!
+                    .send(request)
+                    .timeout(const Duration(seconds: 30));
+                if (response.statusCode == 200) {
+                  uploaded += currentChunkSize;
+                  task.progress = processed / total;
+                  task.statusText = "备份中 ($processed/$total)\n$fileName";
+                  globalTransferManager.notifyListeners();
+                } else {
+                  throw Exception("网络中断");
+                }
               }
+              if (!task.isCanceled) await SyncDatabase.markSynced(asset.id);
+            } finally {
+              raf.closeSync();
             }
-          } catch (e) {
-            isFileSuccess = false;
-          } finally {
-            raf.closeSync();
           }
-          if (isFileSuccess) successCount++;
-        }
-        fetchFiles();
-        if (mounted)
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('成功上传 $successCount 个文件')));
-      } catch (e) {
-      } finally {
-        _uploadClient?.close();
-        _uploadClient = null;
-        if (mounted)
-          setState(() {
-            _isProcessing = false;
-            _progressValue = 0.0;
-            _progressText = "";
-          });
-      }
-    }
+        },
+      ),
+    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('已启动相册后台同步')));
   }
 
   void _copySelected() {
@@ -1270,12 +1485,10 @@ class _FileListPageState extends State<FileListPage> {
     String encodedPath = Uri.encodeComponent(
       "${widget.currentPath.isEmpty ? "" : "${widget.currentPath}/"}$fileName",
     );
-    // 🆕 URL 拼接 token 兼容断流和播放器丢头问题
     String downloadUrl =
         "${widget.serverUrl}/download/$encodedPath?token=${widget.token}";
     String lower = fileName.toLowerCase();
 
-    // 拦截音频
     if (lower.endsWith('.mp3') ||
         lower.endsWith('.flac') ||
         lower.endsWith('.wav') ||
@@ -1284,12 +1497,9 @@ class _FileListPageState extends State<FileListPage> {
       _playAudio(fileName, downloadUrl);
       return;
     }
-
-    // 拦截图频
     if (lower.endsWith('.jpg') ||
         lower.endsWith('.png') ||
         lower.endsWith('.jpeg')) {
-      // 图片直接传带了 token 的 url 过去就行
       Navigator.push(
         context,
         MaterialPageRoute(
@@ -1308,8 +1518,9 @@ class _FileListPageState extends State<FileListPage> {
       return;
     }
 
-    // 其他文件走下载后本地打开逻辑
-    setState(() => _isOpeningFile = true);
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('正在下载文件以打开...')));
     try {
       final tempDir = await getTemporaryDirectory();
       final localPath = '${tempDir.path}/$fileName';
@@ -1319,54 +1530,10 @@ class _FileListPageState extends State<FileListPage> {
         await OpenFilex.open(localPath);
       }
     } catch (e) {
-    } finally {
-      setState(() => _isOpeningFile = false);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('打开失败: $e')));
     }
-  }
-
-  Future<void> _batchDownload() async {
-    setState(() {
-      _isProcessing = true;
-      _progressValue = 0.0;
-      _progressText = "准备下载...";
-    });
-    int successCount = 0,
-        totalFiles = _selectedFiles.length,
-        processedCount = 0;
-    for (String name in _selectedFiles) {
-      try {
-        String encodedPath = Uri.encodeComponent(
-          "${widget.currentPath.isEmpty ? "" : "${widget.currentPath}/"}$name",
-        );
-        var response = await http.get(
-          Uri.parse(
-            "${widget.serverUrl}/download/$encodedPath?token=${widget.token}",
-          ),
-        );
-        if (response.statusCode == 200) {
-          final tempDir = await getTemporaryDirectory();
-          final savePath = '${tempDir.path}/$name';
-          await File(savePath).writeAsBytes(response.bodyBytes);
-          if (name.toLowerCase().endsWith('.mp4') ||
-              name.toLowerCase().endsWith('.mov'))
-            await Gal.putVideo(savePath);
-          else
-            await Gal.putImage(savePath);
-          successCount++;
-        }
-      } catch (e) {}
-      processedCount++;
-      setState(() {
-        _progressValue = processedCount / totalFiles;
-        _progressText = "正在下载 $processedCount / $totalFiles";
-      });
-    }
-    setState(() {
-      _isProcessing = false;
-      _progressValue = 0.0;
-      _progressText = "";
-    });
-    _exitSelectionMode();
   }
 
   void _toggleSelection(String name) {
@@ -1561,14 +1728,50 @@ class _FileListPageState extends State<FileListPage> {
               child: Icon(Icons.cloud, size: 40, color: Colors.blue),
             ),
           ),
+
           ListTile(
             leading: const Icon(Icons.sync, color: Colors.purple),
-            title: const Text("同步手机相册"),
+            title: const Text("手动全面同步相册"),
             onTap: () {
               Navigator.pop(context);
               _syncGallery();
             },
           ),
+
+          SwitchListTile(
+            secondary: const Icon(Icons.autorenew, color: Colors.teal),
+            title: const Text("夜间充电自动备份"),
+            subtitle: const Text("需处于 Wi-Fi 环境"),
+            value: _autoSyncEnabled,
+            onChanged: (val) async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setBool('auto_sync_enabled', val);
+              setState(() => _autoSyncEnabled = val);
+
+              if (val) {
+                Workmanager().registerPeriodicTask(
+                  "autoBackupTask",
+                  "autoBackupTask",
+                  frequency: const Duration(seconds: 10),
+                  constraints: Constraints(
+                    networkType: NetworkType.unmetered,
+                    //requiresCharging: true,
+                  ),
+                );
+                if (mounted)
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('已开启：连接 Wi-Fi 时将自动备份')),
+                  );
+              } else {
+                Workmanager().cancelByUniqueName("autoBackupTask");
+                if (mounted)
+                  ScaffoldMessenger.of(
+                    context,
+                  ).showSnackBar(const SnackBar(content: Text('已关闭自动备份')));
+              }
+            },
+          ),
+
           const Divider(),
           ListTile(
             title: const Text("存储空间"),
@@ -1661,16 +1864,9 @@ class _FileListPageState extends State<FileListPage> {
         ),
       );
     return AppBar(
-      title: Text(
-        _isUploading
-            ? "处理中..."
-            : (_isOpeningFile
-                  ? "打开中..."
-                  : (widget.currentPath.isEmpty ? '我的云盘' : widget.currentPath)),
-      ),
+      title: Text(widget.currentPath.isEmpty ? '我的云盘' : widget.currentPath),
       backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       actions: [
-        // 全局正在播放指示器（当有音乐加载时显示小音符）
         if (_currentPlayingName.isNotEmpty)
           StreamBuilder<PlayerState>(
             stream: _globalAudioPlayer.playerStateStream,
@@ -1686,7 +1882,49 @@ class _FileListPageState extends State<FileListPage> {
               );
             },
           ),
-
+        AnimatedBuilder(
+          animation: globalTransferManager,
+          builder: (context, child) {
+            int count = globalTransferManager.activeCount;
+            return Stack(
+              alignment: Alignment.center,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.swap_vert),
+                  tooltip: "传输任务",
+                  onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const TransferPage()),
+                  ),
+                ),
+                if (count > 0)
+                  Positioned(
+                    right: 8,
+                    top: 8,
+                    child: Container(
+                      padding: const EdgeInsets.all(2),
+                      decoration: BoxDecoration(
+                        color: Colors.red,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      constraints: const BoxConstraints(
+                        minWidth: 16,
+                        minHeight: 16,
+                      ),
+                      child: Text(
+                        '$count',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+              ],
+            );
+          },
+        ),
         IconButton(
           icon: const Icon(Icons.manage_search),
           onPressed: () => Navigator.push(
@@ -1716,40 +1954,9 @@ class _FileListPageState extends State<FileListPage> {
     return Scaffold(
       appBar: _buildAppBar(),
       drawer: (!_isSelectionMode && !_isSearching) ? _buildDrawer() : null,
-      body: Stack(
-        children: [
-          isLoading
-              ? const Center(child: CircularProgressIndicator())
-              : (_isGridView ? _buildGridView() : _buildListView()),
-          if (_isProcessing)
-            Container(
-              color: Colors.black54,
-              child: Center(
-                child: Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24.0),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const CircularProgressIndicator(),
-                        const SizedBox(height: 20),
-                        Text(_progressText, textAlign: TextAlign.center),
-                        const SizedBox(height: 20),
-                        FilledButton(
-                          onPressed: _isAborting ? null : _triggerAbort,
-                          style: FilledButton.styleFrom(
-                            backgroundColor: Colors.red,
-                          ),
-                          child: Text(_isAborting ? "中止中..." : "停止"),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
+      body: isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : (_isGridView ? _buildGridView() : _buildListView()),
       floatingActionButton: (_isSelectionMode || _isSearching)
           ? null
           : (_globalClipboardFiles.isNotEmpty
@@ -1773,36 +1980,32 @@ class _FileListPageState extends State<FileListPage> {
                     ],
                   )
                 : FloatingActionButton(
-                    onPressed: _isUploading
-                        ? null
-                        : () => showModalBottomSheet(
-                            context: context,
-                            builder: (_) => SafeArea(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  ListTile(
-                                    leading: const Icon(
-                                      Icons.create_new_folder,
-                                    ),
-                                    title: const Text('新建文件夹'),
-                                    onTap: () {
-                                      Navigator.pop(context);
-                                      _createNewFolder();
-                                    },
-                                  ),
-                                  ListTile(
-                                    leading: const Icon(Icons.upload_file),
-                                    title: const Text('上传文件'),
-                                    onTap: () {
-                                      Navigator.pop(context);
-                                      _uploadFile();
-                                    },
-                                  ),
-                                ],
-                              ),
+                    onPressed: () => showModalBottomSheet(
+                      context: context,
+                      builder: (_) => SafeArea(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            ListTile(
+                              leading: const Icon(Icons.create_new_folder),
+                              title: const Text('新建文件夹'),
+                              onTap: () {
+                                Navigator.pop(context);
+                                _createNewFolder();
+                              },
                             ),
-                          ),
+                            ListTile(
+                              leading: const Icon(Icons.upload_file),
+                              title: const Text('上传文件'),
+                              onTap: () {
+                                Navigator.pop(context);
+                                _uploadFile();
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                     child: const Icon(Icons.add),
                   )),
     );
@@ -1874,36 +2077,87 @@ class _FileListPageState extends State<FileListPage> {
                   children: [
                     Expanded(
                       child: Card(
-                        child: file['is_dir']
-                            ? const Icon(
+                        color: _selectedFiles.contains(name)
+                            ? Colors.blue.shade50
+                            : null,
+                        shape: _selectedFiles.contains(name)
+                            ? RoundedRectangleBorder(
+                                side: const BorderSide(
+                                  color: Colors.blue,
+                                  width: 2,
+                                ),
+                                borderRadius: BorderRadius.circular(12),
+                              )
+                            : null,
+                        clipBehavior: Clip.antiAlias,
+                        child: Builder(
+                          builder: (context) {
+                            if (file['is_dir']) {
+                              return const Icon(
                                 Icons.folder,
                                 size: 50,
                                 color: Colors.amber,
-                              )
-                            : ([
-                                    '.jpg',
-                                    '.png',
-                                    '.jpeg',
-                                  ].any((e) => name.toLowerCase().endsWith(e))
-                                  ? CachedNetworkImage(
-                                      imageUrl: url,
-                                      httpHeaders: {
-                                        "Authorization":
-                                            "Bearer ${widget.token}",
-                                      },
-                                      fit: BoxFit.cover,
-                                      placeholder: (c, u) =>
-                                          Container(color: Colors.grey[200]),
-                                      errorWidget: (c, u, e) =>
-                                          const Icon(Icons.broken_image),
-                                    )
-                                  : Center(
-                                      child: _getFileIcon(
-                                        name,
-                                        isDir: false,
-                                        size: 50,
+                              );
+                            }
+
+                            // 🆕 判断是否为图片或视频
+                            bool isImage = [
+                              '.jpg',
+                              '.png',
+                              '.jpeg',
+                              '.gif',
+                              '.bmp',
+                            ].any((e) => name.toLowerCase().endsWith(e));
+                            bool isVideo = [
+                              '.mp4',
+                              '.mov',
+                              '.avi',
+                              '.mkv',
+                            ].any((e) => name.toLowerCase().endsWith(e));
+
+                            if (isImage || isVideo) {
+                              return Stack(
+                                fit: StackFit.expand,
+                                children: [
+                                  CachedNetworkImage(
+                                    imageUrl: url,
+                                    httpHeaders: {
+                                      "Authorization": "Bearer ${widget.token}",
+                                    }, // 携带鉴权
+                                    fit: BoxFit.cover,
+                                    memCacheHeight: 200,
+                                    placeholder: (c, u) =>
+                                        Container(color: Colors.grey[200]),
+                                    errorWidget: (c, u, e) => const Icon(
+                                      Icons.broken_image,
+                                      color: Colors.grey,
+                                    ),
+                                  ),
+                                  // 🆕 如果是视频，在封面上叠加一个半透明的播放按钮
+                                  if (isVideo)
+                                    Container(
+                                      color: Colors.black26, // 稍微压暗封面
+                                      child: const Center(
+                                        child: Icon(
+                                          Icons.play_circle_outline,
+                                          color: Colors.white,
+                                          size: 40,
+                                        ),
                                       ),
-                                    )),
+                                    ),
+                                ],
+                              );
+                            } else {
+                              return Center(
+                                child: _getFileIcon(
+                                  name,
+                                  isDir: false,
+                                  size: 50,
+                                ),
+                              );
+                            }
+                          },
+                        ),
                       ),
                     ),
                     Padding(
@@ -1952,7 +2206,6 @@ class ImagePage extends StatelessWidget {
         backgroundColor: Colors.transparent,
         iconTheme: const IconThemeData(color: Colors.white),
       ),
-      // 注意：这里由于我们前面重构了 _openFile，传过来的 url 已经自带 ?token= 尾巴了，但 CachedNetworkImage 依然用 header 传也可，双重保险
       body: Center(
         child: CachedNetworkImage(
           imageUrl: url,
@@ -1978,7 +2231,6 @@ class _VideoPageState extends State<VideoPage> {
   @override
   void initState() {
     super.initState();
-    // 视频因为要拖动进度条，底层播放器会丢头，所以这里移除了 httpHeaders，直接通过带 ?token= 的 URL 播放
     _vc = VideoPlayerController.networkUrl(Uri.parse(widget.url))
       ..initialize().then((_) {
         setState(
