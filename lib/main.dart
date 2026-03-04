@@ -174,7 +174,7 @@ Future<void> main() async {
 
   // 注册后台任务引擎
   try {
-    Workmanager().initialize(callbackDispatcher); // 👈 直接闭合即可
+    Workmanager().initialize(callbackDispatcher);
   } catch (e) {
     debugPrint("Workmanager init failed: $e");
   }
@@ -426,7 +426,8 @@ class _ConnectPageState extends State<ConnectPage> {
 
       if (response.statusCode == 200) {
         final prefs = await SharedPreferences.getInstance();
-        String token = jsonDecode(response.body)['token'];
+        String token = jsonDecode(response.body)['token'] ?? "dummy_token";
+        // 修正：Python服务端目前未返回token，如果后续实现JWT，此处将接收真实token
         await prefs.setString('server_token', token);
         await prefs.setString('server_ip', ip);
         await prefs.setString('server_user', user);
@@ -1753,10 +1754,7 @@ class _FileListPageState extends State<FileListPage> {
                   "autoBackupTask",
                   "autoBackupTask",
                   frequency: const Duration(seconds: 10),
-                  constraints: Constraints(
-                    networkType: NetworkType.unmetered,
-                    //requiresCharging: true,
-                  ),
+                  constraints: Constraints(networkType: NetworkType.unmetered),
                 );
                 if (mounted)
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -1789,6 +1787,27 @@ class _FileListPageState extends State<FileListPage> {
             ),
           ),
           const Spacer(),
+          // === 🆕 插入远程配置入口 ===
+          ListTile(
+            leading: const Icon(Icons.settings_remote, color: Colors.blueGrey),
+            title: const Text("服务器远程设置"),
+            onTap: () async {
+              Navigator.pop(context); // 收起侧边栏
+              bool? shouldRefresh = await Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => RemoteConfigPage(
+                    serverUrl: widget.serverUrl,
+                    token: widget.token,
+                  ),
+                ),
+              );
+              // 如果仅修改了路径，回来后自动刷新文件列表
+              if (shouldRefresh == true) {
+                fetchFiles();
+              }
+            },
+          ),
           ListTile(
             leading: const Icon(Icons.logout, color: Colors.red),
             title: const Text("退出登录", style: TextStyle(color: Colors.red)),
@@ -2100,7 +2119,6 @@ class _FileListPageState extends State<FileListPage> {
                               );
                             }
 
-                            // 🆕 判断是否为图片或视频
                             bool isImage = [
                               '.jpg',
                               '.png',
@@ -2133,10 +2151,9 @@ class _FileListPageState extends State<FileListPage> {
                                       color: Colors.grey,
                                     ),
                                   ),
-                                  // 🆕 如果是视频，在封面上叠加一个半透明的播放按钮
                                   if (isVideo)
                                     Container(
-                                      color: Colors.black26, // 稍微压暗封面
+                                      color: Colors.black26,
                                       child: const Center(
                                         child: Icon(
                                           Icons.play_circle_outline,
@@ -2259,6 +2276,176 @@ class _VideoPageState extends State<VideoPage> {
         child: _cc != null
             ? Chewie(controller: _cc!)
             : const CircularProgressIndicator(),
+      ),
+    );
+  }
+}
+
+// === 🆕 新增：App 远程服务器配置页面 ===
+class RemoteConfigPage extends StatefulWidget {
+  final String serverUrl;
+  final String token;
+  const RemoteConfigPage({
+    super.key,
+    required this.serverUrl,
+    required this.token,
+  });
+
+  @override
+  State<RemoteConfigPage> createState() => _RemoteConfigPageState();
+}
+
+class _RemoteConfigPageState extends State<RemoteConfigPage> {
+  final _oldPwdController = TextEditingController();
+  final _newUserController = TextEditingController();
+  final _newPwdController = TextEditingController();
+  final _newPathController = TextEditingController();
+  bool _isSubmitting = false;
+
+  Future<void> _submitConfig() async {
+    if (_oldPwdController.text.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('必须输入当前密码进行验证')));
+      return;
+    }
+
+    setState(() => _isSubmitting = true);
+
+    try {
+      final response = await http.post(
+        Uri.parse('${widget.serverUrl}/update_config'),
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer ${widget.token}",
+        },
+        body: jsonEncode({
+          "old_password": _oldPwdController.text.trim(),
+          "new_username": _newUserController.text.trim().isNotEmpty
+              ? _newUserController.text.trim()
+              : null,
+          "new_password": _newPwdController.text.trim().isNotEmpty
+              ? _newPwdController.text.trim()
+              : null,
+          "new_root_dir": _newPathController.text.trim().isNotEmpty
+              ? _newPathController.text.trim()
+              : null,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('🎉 服务器配置已热更新！')));
+
+          // 如果修改了账号或密码，本地凭证失效，直接踢回登录页
+          if (_newUserController.text.isNotEmpty ||
+              _newPwdController.text.isNotEmpty) {
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.remove('server_token');
+            await prefs.remove('server_user');
+            await prefs.remove('server_pwd');
+            Navigator.pushAndRemoveUntil(
+              context,
+              MaterialPageRoute(builder: (_) => const ConnectPage()),
+              (route) => false,
+            );
+          } else {
+            Navigator.pop(context, true); // 仅修改了路径，返回上一页并通知刷新
+          }
+        }
+      } else {
+        var err =
+            jsonDecode(utf8.decode(response.bodyBytes))['detail'] ?? '更新失败';
+        if (mounted)
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('❌ $err')));
+      }
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('网络请求失败')));
+    } finally {
+      if (mounted) setState(() => _isSubmitting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("服务器远程设置")),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              "⚠️ 修改立刻生效，服务器无需重启",
+              style: TextStyle(
+                color: Colors.orange,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 20),
+            TextField(
+              controller: _oldPwdController,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: "当前服务器密码 (必填)",
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.security, color: Colors.red),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 20),
+              child: Divider(),
+            ),
+            const Text("以下项如不修改请留空：", style: TextStyle(color: Colors.grey)),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _newUserController,
+              decoration: const InputDecoration(
+                labelText: "新用户名",
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.person),
+              ),
+            ),
+            const SizedBox(height: 15),
+            TextField(
+              controller: _newPwdController,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: "新密码",
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.key),
+              ),
+            ),
+            const SizedBox(height: 15),
+            TextField(
+              controller: _newPathController,
+              decoration: const InputDecoration(
+                labelText: "新共享目录 (例: E:\\Backup)",
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.folder),
+              ),
+            ),
+            const SizedBox(height: 30),
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: FilledButton.icon(
+                onPressed: _isSubmitting ? null : _submitConfig,
+                icon: _isSubmitting
+                    ? const CircularProgressIndicator(color: Colors.white)
+                    : const Icon(Icons.save),
+                label: Text(_isSubmitting ? "正在应用..." : "立即应用新配置"),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -6,6 +6,7 @@ import socket
 import threading
 import sqlite3
 import pickle
+import secrets
 import uvicorn
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -13,8 +14,10 @@ from typing import List
 from io import BytesIO
 from PIL import Image, ImageTk
 import qrcode
+import hashlib
+import cv2  # 🆕 引入视频处理库
 
-# 🆕 引入 AI 库 (如果是第一次运行，会有点慢)
+# 引入 AI 库
 try:
     from sentence_transformers import SentenceTransformer, util
     HAS_AI = True
@@ -22,13 +25,13 @@ except ImportError:
     HAS_AI = False
     print("警告: 未安装 AI 库，智能搜索功能不可用。请运行 pip install sentence-transformers torch")
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+# 🆕 增加了 Request 和 FileResponse 以支持断点续流和 URL Token
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-# ... (基础配置保持不变) ...
 CONFIG_FILE = "server_config.json"
 DEFAULT_CONFIG = {
     "root_dir": "D:\\MyCloud",
@@ -41,9 +44,27 @@ server_thread = None
 uvicorn_server = None
 app = FastAPI()
 
-# 🆕 AI 全局变量
+# AI 与数据库全局变量
 ai_model = None
 DB_FILE = "ai_index.db"
+
+# === 鉴权核心配置 ===
+# 🆕 auto_error=False 允许请求头为空，以便我们通过 URL 参数获取 Token
+security = HTTPBearer(auto_error=False)
+VALID_TOKENS = set()  # 内存中存储白名单 Token
+
+def verify_token(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """校验每次请求携带的 Token 是否合法 (支持 Header 和 URL 参数)"""
+    # 1. 先尝试从 URL 参数获取 token (专门防音视频播放器丢 Header 的问题)
+    token = request.query_params.get("token")
+    
+    # 2. 如果 URL 里没有，再去检查请求头
+    if not token and credentials:
+        token = credentials.credentials
+        
+    if token not in VALID_TOKENS:
+        raise HTTPException(status_code=401, detail="无效或已过期的 Token，请重新登录")
+    return token
 
 def load_config():
     global current_config
@@ -59,23 +80,18 @@ def save_config():
 
 def get_root_dir(): return current_config["root_dir"]
 
-# 🆕 初始化数据库
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # 创建表：路径, 修改时间, 向量数据
-    c.execute('''CREATE TABLE IF NOT EXISTS photos 
-                 (path TEXT PRIMARY KEY, mtime REAL, embedding BLOB)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS photos (path TEXT PRIMARY KEY, mtime REAL, embedding BLOB)''')
     conn.commit()
     conn.close()
 
-# 🆕 加载 AI 模型 (懒加载，用到时再载入)
 def get_ai_model():
     global ai_model
     if not HAS_AI: return None
     if ai_model is None:
         print("正在加载 AI 模型 (clip-ViT-B-32)，首次运行需要下载模型，请耐心等待...")
-        # 支持中文的多语言 CLIP 模型
         ai_model = SentenceTransformer('clip-ViT-B-32') 
         print("AI 模型加载完成！")
     return ai_model
@@ -96,44 +112,77 @@ def login_check(data: dict):
     req_pass = data.get("password", "")
     target_user = current_config["username"]
     target_pass = current_config["password"]
-    if req_pass == target_pass:
-        if req_user and req_user != target_user:
-             raise HTTPException(status_code=401, detail="用户名或密码错误")
-        return {"status": "ok"}
+    if req_pass == target_pass and (not req_user or req_user == target_user):
+        token = secrets.token_hex(32)
+        VALID_TOKENS.add(token)
+        return {"status": "ok", "token": token}
     else:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
 @app.get("/download/{file_path:path}")
-def download_file(file_path: str):
+def download_file(file_path: str, token: str = Depends(verify_token)):
     root = get_root_dir()
     full_path = os.path.join(root, file_path)
     if not os.path.exists(full_path): return {"error": "File not found"}
-    return StreamingResponse(open(full_path, "rb"))
+    # 🆕 替换为 FileResponse，原生完美支持 HTTP Range (断点音频/视频流)
+    return FileResponse(full_path)
 
 @app.get("/thumbnail")
-async def get_thumbnail(path: str):
+async def get_thumbnail(path: str, token: str = Depends(verify_token)):
     root = get_root_dir()
     full_path = os.path.join(root, path)
-    if not os.path.exists(full_path): return StreamingResponse(BytesIO(b""), status_code=404)
+    if not os.path.exists(full_path): 
+        return StreamingResponse(BytesIO(b""), status_code=404)
+    
+    # 🆕 1. 建立隐藏的缓存目录
+    cache_dir = os.path.join(root, ".cache", "thumbnails")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # 🆕 2. 使用文件绝对路径的 MD5 作为缓存文件名 (避免创建复杂的嵌套目录)
+    path_hash = hashlib.md5(full_path.encode('utf-8')).hexdigest()
+    cache_file = os.path.join(cache_dir, f"{path_hash}.jpg")
+    
+    # 🆕 3. 检查缓存是否存在，且缓存时间晚于源文件修改时间 (防止原图被覆盖但缩略图没更新)
+    if os.path.exists(cache_file) and os.path.getmtime(cache_file) >= os.path.getmtime(full_path):
+        return FileResponse(cache_file)
+        
+    # 🆕 4. 如果没有缓存，则生成它
     try:
-        with Image.open(full_path) as img:
-            if img.mode == 'RGBA': img = img.convert('RGB')
-            img.thumbnail((200, 200))
-            img_io = BytesIO()
-            img.save(img_io, 'JPEG', quality=70)
-            img_io.seek(0)
-            return StreamingResponse(img_io, media_type="image/jpeg")
-    except: return StreamingResponse(BytesIO(b""), status_code=500)
+        ext = full_path.lower().split('.')[-1]
+        
+        # 处理视频封面
+        if ext in ['mp4', 'mov', 'avi', 'mkv']:
+            cap = cv2.VideoCapture(full_path)
+            ret, frame = cap.read() # 读取第一帧
+            cap.release()
+            if ret:
+                # 将视频帧压缩并保存为 JPEG 缓存
+                frame = cv2.resize(frame, (200, 200), interpolation=cv2.INTER_AREA)
+                cv2.imwrite(cache_file, frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                return FileResponse(cache_file)
+            else:
+                return StreamingResponse(BytesIO(b""), status_code=500)
+                
+        # 处理图片缩略图
+        else:
+            with Image.open(full_path) as img:
+                if img.mode == 'RGBA': img = img.convert('RGB')
+                img.thumbnail((200, 200))
+                img.save(cache_file, 'JPEG', quality=70)
+            return FileResponse(cache_file)
+            
+    except Exception as e: 
+        return StreamingResponse(BytesIO(b""), status_code=500)
 
 @app.get("/disk_usage")
-def get_disk_usage():
+def get_disk_usage(token: str = Depends(verify_token)):
     try:
         total, used, free = shutil.disk_usage(get_root_dir())
         return {"total": total, "used": used, "free": free}
     except Exception as e: return {"error": str(e)}
 
 @app.get("/files")
-def list_files(path: str = ""):
+def list_files(path: str = "", token: str = Depends(verify_token)):
     root = get_root_dir()
     full_path = os.path.join(root, path)
     if not os.path.exists(full_path): return {"error": "Path not found"}
@@ -152,13 +201,64 @@ def list_files(path: str = ""):
     items.sort(key=lambda x: (not x['is_dir'], x['name']))
     return items
 
-@app.post("/upload")
-async def upload_files(path: str = Form(...), files: List[UploadFile] = File(...)):
+class CheckUploadModel(BaseModel):
+    path: str
+    filename: str
+    total_size: int
+
+@app.post("/check_upload")
+def check_upload(data: CheckUploadModel, token: str = Depends(verify_token)):
+    root = get_root_dir()
+    target_dir = os.path.join(root, data.path)
+    final_file = os.path.join(target_dir, data.filename)
+    tmp_file = final_file + ".tmp"
+    
+    if os.path.exists(final_file) and os.path.getsize(final_file) == data.total_size:
+        return {"status": "finished", "uploaded": data.total_size}
+    if os.path.exists(tmp_file):
+        tmp_size = os.path.getsize(tmp_file)
+        if tmp_size > data.total_size:
+            os.remove(tmp_file)
+            return {"status": "new", "uploaded": 0}
+        return {"status": "incomplete", "uploaded": tmp_size}
+    return {"status": "new", "uploaded": 0}
+
+@app.post("/upload_chunk")
+async def upload_chunk(
+    path: str = Form(...), filename: str = Form(...),
+    offset: int = Form(...), total_size: int = Form(...),
+    file: UploadFile = File(...), token: str = Depends(verify_token)
+):
     root = get_root_dir()
     target_dir = os.path.join(root, path)
-    if not os.path.exists(target_dir):
-        try: os.makedirs(target_dir)
-        except Exception as e: return {"error": f"Failed to create directory: {str(e)}"}     
+    os.makedirs(target_dir, exist_ok=True)
+    final_file = os.path.join(target_dir, filename)
+    tmp_file = final_file + ".tmp"
+    chunk_data = await file.read()
+    
+    try:
+        if offset == 0:
+            with open(tmp_file, "wb") as f: f.write(chunk_data)
+        else:
+            if not os.path.exists(tmp_file):
+                raise HTTPException(status_code=400, detail="Temp file missing")
+            with open(tmp_file, "r+b") as f:
+                f.seek(offset)
+                f.write(chunk_data)
+        
+        current_size = os.path.getsize(tmp_file)
+        if current_size >= total_size:
+            if os.path.exists(final_file): os.remove(final_file)
+            os.rename(tmp_file, final_file)
+            return {"status": "finished"}
+        return {"status": "uploading", "uploaded": current_size}
+    except Exception as e: return {"error": str(e)}
+
+@app.post("/upload")
+async def upload_files(path: str = Form(...), files: List[UploadFile] = File(...), token: str = Depends(verify_token)):
+    root = get_root_dir()
+    target_dir = os.path.join(root, path)
+    os.makedirs(target_dir, exist_ok=True)
     try:
         for file in files:
             file_location = os.path.join(target_dir, file.filename)
@@ -182,7 +282,7 @@ class BatchCheckModel(BaseModel):
     paths: List[str]
 
 @app.post("/batch_check_exists")
-def batch_check_exists(data: BatchCheckModel):
+def batch_check_exists(data: BatchCheckModel, token: str = Depends(verify_token)):
     root = get_root_dir()
     results = []
     for relative_path in data.paths:
@@ -190,106 +290,65 @@ def batch_check_exists(data: BatchCheckModel):
         results.append(os.path.exists(full_path))
     return {"results": results}
 
-# === 🆕 AI 核心接口 ===
-
-# 1. 触发 AI 索引 (扫描文件夹，分析未分析的图片)
 @app.get("/index_photos")
-def index_photos_endpoint():
+def index_photos_endpoint(token: str = Depends(verify_token)):
     if not HAS_AI: return {"error": "AI library not installed"}
     model = get_ai_model()
     root = get_root_dir()
-    
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    
-    indexed_count = 0
-    errors = 0
-    
-    # 遍历所有文件
+    indexed_count, errors = 0, 0
     for dirpath, dirnames, filenames in os.walk(root):
         for filename in filenames:
             if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif')):
                 full_path = os.path.join(dirpath, filename)
                 rel_path = os.path.relpath(full_path, root).replace("\\", "/")
                 mtime = os.path.getmtime(full_path)
-                
-                # 检查是否已分析且未修改
                 c.execute("SELECT mtime FROM photos WHERE path=?", (rel_path,))
                 row = c.fetchone()
-                if row and row[0] == mtime:
-                    continue # 已存在且没变，跳过
-                
-                # 开始分析
+                if row and row[0] == mtime: continue
                 try:
                     img = Image.open(full_path)
-                    # 计算向量 (Embedding)
                     emb = model.encode(img)
-                    # 存入数据库 (使用 pickle 序列化向量)
                     emb_blob = pickle.dumps(emb)
                     c.execute("INSERT OR REPLACE INTO photos (path, mtime, embedding) VALUES (?, ?, ?)",
                               (rel_path, mtime, emb_blob))
                     indexed_count += 1
-                    # 每处理 10 张提交一次，防止卡死
                     if indexed_count % 10 == 0: conn.commit()
-                except Exception as e:
-                    print(f"Error processing {rel_path}: {e}")
-                    errors += 1
-    
+                except Exception as e: errors += 1
     conn.commit()
     conn.close()
     return {"status": "finished", "indexed": indexed_count, "errors": errors}
 
-# 2. AI 搜索接口
 class SearchModel(BaseModel):
     query: str
     limit: int = 20
 
 @app.post("/ai_search")
-def ai_search_endpoint(data: SearchModel):
+def ai_search_endpoint(data: SearchModel, token: str = Depends(verify_token)):
     if not HAS_AI: return {"error": "AI library not installed"}
     model = get_ai_model()
-    
-    # 1. 把文字变成向量
     text_emb = model.encode(data.query)
-    
-    # 2. 从数据库取出所有图片向量
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT path, embedding FROM photos")
     rows = c.fetchall()
     conn.close()
-    
     if not rows: return {"results": []}
-    
     paths = []
     img_embs = []
     for path, emb_blob in rows:
         paths.append(path)
         img_embs.append(pickle.loads(emb_blob))
-    
-    # 3. 计算相似度 (Cosine Similarity)
-    # util.cos_sim 返回的是一个矩阵，我们取第一行
     scores = util.cos_sim(text_emb, img_embs)[0]
-    
-    # 4. 排序并取前 N 个
-    # torch.topk 可以快速取前几名
-    top_results = []
-    # 简单的 python 排序 (为了不依赖 torch 的复杂 tensor 操作，这里转成 list 处理)
     score_list = scores.tolist()
     combined = list(zip(paths, score_list))
-    # 按分数降序排
     combined.sort(key=lambda x: x[1], reverse=True)
-    
-    # 取前 N 个，且分数要大于一定阈值 (比如 0.2) 过滤掉完全不相关的
-    results = []
-    for path, score in combined[:data.limit]:
-        results.append({"path": path, "score": score})
-        
+    results = [{"path": path, "score": score} for path, score in combined[:data.limit]]
     return {"results": results}
 
-# ... (其余基础接口 batch_delete, mkdir 等保持不变，为节省篇幅略去，请保留原有的) ...
 @app.post("/batch_delete")
-def batch_delete(data: CommonModel):
+def batch_delete(data: CommonModel, token: str = Depends(verify_token)):
     root = get_root_dir()
     parent = os.path.join(root, data.parent_path)
     count = 0
@@ -302,14 +361,14 @@ def batch_delete(data: CommonModel):
     return {"info": f"Deleted {count}"}
 
 @app.post("/mkdir")
-def mkdir(data: CommonModel):
+def mkdir(data: CommonModel, token: str = Depends(verify_token)):
     target = os.path.join(get_root_dir(), data.path, data.folder_name)
     if os.path.exists(target): return {"error": "Exists"}
     os.makedirs(target)
     return {"info": "Created"}
 
 @app.post("/rename")
-def rename(data: CommonModel):
+def rename(data: CommonModel, token: str = Depends(verify_token)):
     old = os.path.join(get_root_dir(), data.old_path)
     new = os.path.join(os.path.dirname(old), data.new_name)
     if os.path.exists(new): return {"error": "Exists"}
@@ -317,7 +376,7 @@ def rename(data: CommonModel):
     return {"info": "Renamed"}
 
 @app.post("/batch_copy")
-def batch_copy(data: CommonModel):
+def batch_copy(data: CommonModel, token: str = Depends(verify_token)):
     src_dir = os.path.join(get_root_dir(), data.src_path)
     dest_dir = os.path.join(get_root_dir(), data.dest_path)
     count = 0
@@ -331,7 +390,7 @@ def batch_copy(data: CommonModel):
     return {"info": f"Copied {count}"}
 
 @app.post("/batch_move")
-def batch_move(data: CommonModel):
+def batch_move(data: CommonModel, token: str = Depends(verify_token)):
     src_dir = os.path.join(get_root_dir(), data.src_path)
     dest_dir = os.path.join(get_root_dir(), data.dest_path)
     count = 0
@@ -343,22 +402,22 @@ def batch_move(data: CommonModel):
             count += 1
     return {"info": f"Moved {count}"}
 
-# === GUI 部分 (保持不变) ===
+# === GUI 部分 ===
 class ServerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("私有云盘服务端 v4.0 (AI 旗舰版)")
+        self.root.title("私有云盘服务端 v6.0 (旗舰影音版)")
         self.root.geometry("500x550")
         self.root.resizable(False, False)
         load_config()
-        init_db() # 初始化数据库
+        init_db()
         self.is_running = False
 
         tk.Label(root, text="☁️ 私有云盘服务器", font=("Microsoft YaHei", 18, "bold"), fg="#333").pack(pady=15)
         setting_frame = tk.LabelFrame(root, text="服务器设置", font=("Microsoft YaHei", 10), padx=10, pady=10)
         setting_frame.pack(fill="x", padx=20)
 
-        tk.Label(setting_frame, text="共享文件夹路径:").grid(row=0, column=0, sticky="w", pady=5)
+        tk.Label(setting_frame, text="共享文件夹:").grid(row=0, column=0, sticky="w", pady=5)
         self.path_var = tk.StringVar(value=current_config["root_dir"])
         self.entry_path = tk.Entry(setting_frame, textvariable=self.path_var, width=35)
         self.entry_path.grid(row=0, column=1, padx=5)
@@ -391,11 +450,10 @@ class ServerApp:
         self.ip_label.pack()
         self.update_ip_label()
         
-        # 提示信息
         if not HAS_AI:
             tk.Label(root, text="⚠️ 未检测到 AI 库，搜索功能不可用", fg="orange").pack(pady=5)
         else:
-            tk.Label(root, text="✨ AI 智能搜索已就绪 (首次搜索需加载模型)", fg="purple").pack(pady=5)
+            tk.Label(root, text="✨ AI搜图 | 断点续传 | URL Token 鉴权已就绪", fg="purple").pack(pady=5)
 
     def update_ip_label(self):
         try:
